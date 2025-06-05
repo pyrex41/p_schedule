@@ -1,0 +1,295 @@
+# Email Scheduler Configuration
+# This file defines all configurable parameters for the email scheduling system
+
+# =============================================================================
+# TIMING CONFIGURATION
+# =============================================================================
+timing_constants:
+  # Default send time in Central Time
+  send_time: "08:30:00"
+  
+  # Days before anniversary to send birthday emails
+  birthday_email_days_before: 14
+  
+  # Days before anniversary to send effective date emails
+  effective_date_days_before: 30
+  
+  # Days before exclusion window starts to apply pre-window exclusion
+  pre_window_exclusion_days: 60
+  
+  # Days after initial email to send follow-ups
+  followup_days_after: 2
+
+# =============================================================================
+# ANNUAL ENROLLMENT PERIOD (AEP) CONFIGURATION
+# =============================================================================
+aep_config:
+  default_dates:
+    - month: 9
+      day: 15
+  years: [2024, 2025, 2026, 2027, 2028]
+
+# =============================================================================
+# LOAD BALANCING AND SMOOTHING CONFIGURATION
+# =============================================================================
+load_balancing:
+  # Maximum percentage of org contacts to send emails to per day
+  daily_send_percentage_cap: 0.07  # 7%
+  
+  # Soft limit for effective date emails per day
+  ed_daily_soft_limit: 15
+  
+  # Percentage of daily cap that triggers redistribution
+  ed_soft_limit_percentage: 0.30  # 30% of daily cap
+  
+  # Window for smoothing effective date email clustering (±N days)
+  ed_smoothing_window_days: 2
+  
+  # Threshold that triggers redistribution (percentage over cap)
+  overage_threshold: 1.2  # 120%
+  
+  # Window for distributing catch-up emails (days)
+  catch_up_spread_days: 7
+  
+  # Maximum emails per contact in a given period
+  max_emails_per_contact_per_period: 2
+  
+  # Period for checking email frequency (days)
+  period_days: 14
+
+# =============================================================================
+# PROCESSING CONFIGURATION
+# =============================================================================
+processing:
+  # Number of contacts to process in each batch
+  batch_size: 10000
+  
+  # Enable performance optimizations for large datasets
+  enable_streaming: true
+  
+  # Maximum number of retry attempts for failed operations
+  max_retry_attempts: 3
+  
+  # Delay between retry attempts (seconds)
+  retry_delay: 5
+
+# =============================================================================
+# STATE EXCLUSION RULES CONFIGURATION
+# =============================================================================
+state_rules:
+  # Year-round exclusion states (no emails sent ever)
+  year_round_exclusion:
+    - CT  # Connecticut
+    - MA  # Massachusetts
+    - NY  # New York
+    - WA  # Washington
+  
+  # Birthday-based exclusion windows
+  birthday_windows:
+    CA:  # California
+      window_before_days: 30
+      window_after_days: 60
+      pre_window_extension_days: 60
+    
+    ID:  # Idaho
+      window_before_days: 0
+      window_after_days: 63
+      pre_window_extension_days: 60
+    
+    KY:  # Kentucky
+      window_before_days: 0
+      window_after_days: 60
+      pre_window_extension_days: 60
+    
+    MD:  # Maryland
+      window_before_days: 0
+      window_after_days: 30
+      pre_window_extension_days: 60
+    
+    NV:  # Nevada (special: uses month start)
+      window_before_days: 0
+      window_after_days: 60
+      use_month_start: true
+      pre_window_extension_days: 60
+    
+    OK:  # Oklahoma
+      window_before_days: 0
+      window_after_days: 60
+      pre_window_extension_days: 60
+    
+    OR:  # Oregon
+      window_before_days: 0
+      window_after_days: 31
+      pre_window_extension_days: 60
+    
+    VA:  # Virginia
+      window_before_days: 0
+      window_after_days: 30
+      pre_window_extension_days: 60
+  
+  # Effective date-based exclusion windows
+  effective_date_windows:
+    MO:  # Missouri
+      window_before_days: 30
+      window_after_days: 33
+      pre_window_extension_days: 60
+
+# =============================================================================
+# CAMPAIGN TYPES CONFIGURATION
+# =============================================================================
+campaign_types:
+  rate_increase:
+    respect_exclusion_windows: true
+    enable_followups: true
+    days_before_event: 14
+    target_all_contacts: false
+    priority: 1
+    active: true
+  
+  seasonal_promo:
+    respect_exclusion_windows: true
+    enable_followups: true
+    days_before_event: 7
+    target_all_contacts: false
+    priority: 5
+    active: true
+  
+  initial_blast:
+    respect_exclusion_windows: false
+    enable_followups: false
+    days_before_event: 0
+    target_all_contacts: true
+    priority: 10
+    active: true
+  
+  regulatory_notice:
+    respect_exclusion_windows: false  # Regulatory notices bypass exclusions
+    enable_followups: false
+    days_before_event: 0
+    target_all_contacts: false
+    priority: 1
+    active: true
+  
+  policy_update:
+    respect_exclusion_windows: true
+    enable_followups: true
+    days_before_event: 5
+    target_all_contacts: true
+    priority: 3
+    active: true
+
+# =============================================================================
+# EMAIL TEMPLATES CONFIGURATION
+# =============================================================================
+email_templates:
+  # Anniversary-based email templates
+  anniversary:
+    birthday: "birthday_standard_v1"
+    effective_date: "effective_date_standard_v1"
+    aep: "aep_standard_v1"
+    post_window: "post_window_catchup_v1"
+  
+  # Follow-up email templates
+  followups:
+    cold: "followup_cold_v1"
+    clicked_no_hq: "followup_clicked_v1"
+    hq_no_conditions: "followup_healthy_v1"
+    hq_with_conditions: "followup_conditions_v1"
+  
+  # SMS templates (optional)
+  sms:
+    birthday: "birthday_sms_v1"
+    effective_date: "effective_date_sms_v1"
+    followup_cold: "followup_cold_sms_v1"
+
+# =============================================================================
+# LOGGING AND MONITORING CONFIGURATION
+# =============================================================================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(levelname)s - %(message)s"
+  
+  # Enable detailed performance timing logs
+  enable_timing_logs: true
+  
+  # Enable database operation logs
+  enable_db_logs: true
+  
+  # Log file path (optional - logs to console if not specified)
+  # log_file: "/var/log/email_scheduler.log"
+
+# =============================================================================
+# DATABASE CONFIGURATION
+# =============================================================================
+database:
+  # Enable foreign key constraints
+  foreign_keys: true
+  
+  # SQLite-specific optimizations
+  sqlite_optimizations:
+    journal_mode: "WAL"  # Write-Ahead Logging
+    synchronous: "NORMAL"
+    cache_size: 10000
+    temp_store: "MEMORY"
+  
+  # Connection pool settings (for future database backends)
+  connection_pool:
+    max_connections: 5
+    connection_timeout: 30
+
+# =============================================================================
+# AUDIT AND RECOVERY CONFIGURATION
+# =============================================================================
+audit:
+  # Enable detailed audit logging
+  enable_audit_logs: true
+  
+  # Retain audit logs for N days
+  audit_retention_days: 90
+  
+  # Enable point-in-time backup before each run
+  enable_pit_backups: true
+  
+  # Backup retention period
+  backup_retention_days: 7
+  
+  # Backup directory path
+  # backup_directory: "/var/backups/email_scheduler"
+
+# =============================================================================
+# PERFORMANCE OPTIMIZATION CONFIGURATION
+# =============================================================================
+performance:
+  # Enable parallel processing where safe
+  enable_parallel_processing: false
+  
+  # Number of worker processes for parallel operations
+  worker_processes: 2
+  
+  # Enable database connection pooling
+  enable_connection_pooling: true
+  
+  # Cache frequently accessed data
+  enable_caching: true
+  
+  # Cache TTL in seconds
+  cache_ttl: 300  # 5 minutes
+
+# =============================================================================
+# FEATURE FLAGS
+# =============================================================================
+features:
+  # Enable campaign-based emails
+  enable_campaigns: true
+  
+  # Enable follow-up emails
+  enable_followups: true
+  
+  # Enable load balancing and smoothing
+  enable_load_balancing: true
+  
+  # Enable SMS scheduling (requires SMS infrastructure)
+  enable_sms: false
+  
+  # Enable A/B testing features
+  enable_ab_testing: false

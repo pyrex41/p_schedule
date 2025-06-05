@@ -17,6 +17,7 @@ from enum import Enum
 import uuid
 import yaml
 from pathlib import Path
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -398,6 +399,9 @@ class DatabaseManager:
             
             # Create additional tracking tables
             self._create_tracking_tables(conn)
+            
+            # Create performance indexes
+            self._create_performance_indexes(conn)
     
     def _create_campaign_tables(self, conn: sqlite3.Connection):
         """Create campaign system tables"""
@@ -500,6 +504,29 @@ class DatabaseManager:
                 created_by TEXT
             )
         """)
+    
+    def _create_performance_indexes(self, conn: sqlite3.Connection):
+        """Create performance indexes for the scheduler"""
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_contacts_state_birthday ON contacts(state, birth_date)",
+            "CREATE INDEX IF NOT EXISTS idx_contacts_state_effective ON contacts(state, effective_date)",
+            "CREATE INDEX IF NOT EXISTS idx_campaigns_active ON campaign_instances(active_start_date, active_end_date)",
+            "CREATE INDEX IF NOT EXISTS idx_schedules_lookup ON email_schedules(contact_id, email_type, scheduled_send_date)",
+            "CREATE INDEX IF NOT EXISTS idx_schedules_contact_period ON email_schedules(contact_id, scheduled_send_date, status)",
+            "CREATE INDEX IF NOT EXISTS idx_schedules_status_date ON email_schedules(status, scheduled_send_date)",
+            "CREATE INDEX IF NOT EXISTS idx_schedules_run_id ON email_schedules(scheduler_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_contact_campaigns_contact ON contact_campaigns(contact_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_contact_campaigns_instance ON contact_campaigns(campaign_instance_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_run_id ON scheduler_checkpoints(scheduler_run_id)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_timestamp ON scheduler_checkpoints(run_timestamp)"
+        ]
+        
+        for index_sql in indexes:
+            try:
+                conn.execute(index_sql)
+                logger.debug(f"Created index: {index_sql.split('ON')[0].split('EXISTS')[1].strip()}")
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Could not create index: {e}")
     
     def get_contacts_batch(self, offset: int = 0, limit: int = 10000) -> List[Contact]:
         """Get a batch of contacts for processing"""
@@ -608,29 +635,97 @@ class DatabaseManager:
             
             return campaigns
     
-    def batch_insert_schedules(self, schedules: List[Dict[str, Any]]):
-        """Batch insert email schedules"""
+    def execute_with_retry(self, operation, max_attempts=3, backoff_base=2):
+        """Execute database operation with retry and exponential backoff"""
+        for attempt in range(max_attempts):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if attempt == max_attempts - 1:
+                    logger.error(f"Database operation failed after {max_attempts} attempts: {e}")
+                    raise
+                sleep_time = backoff_base ** attempt
+                logger.warning(f"Database retry {attempt + 1}/{max_attempts} after {sleep_time}s: {e}")
+                time.sleep(sleep_time)
+            except Exception as e:
+                logger.error(f"Non-recoverable database error: {e}")
+                raise
+    
+    def create_checkpoint(self, scheduler_run_id: str, contact_count: int) -> int:
+        """Create a scheduler checkpoint for audit and recovery"""
+        def _create():
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("""
+                    INSERT INTO scheduler_checkpoints 
+                    (run_timestamp, scheduler_run_id, contacts_checksum, status, contacts_processed)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    datetime.now().isoformat(),
+                    scheduler_run_id,
+                    hashlib.md5(f"{contact_count}_{datetime.now()}".encode()).hexdigest(),
+                    'started',
+                    0
+                ))
+                return cursor.lastrowid
+        
+        return self.execute_with_retry(_create)
+    
+    def update_checkpoint(self, checkpoint_id: int, status: str, **kwargs):
+        """Update checkpoint with completion status and metrics"""
+        def _update():
+            with sqlite3.connect(self.db_path) as conn:
+                # Build dynamic update query
+                set_clauses = ['status = ?']
+                params = [status]
+                
+                for key, value in kwargs.items():
+                    set_clauses.append(f"{key} = ?")
+                    params.append(value)
+                
+                if status in ['completed', 'failed']:
+                    set_clauses.append('completed_at = ?')
+                    params.append(datetime.now().isoformat())
+                
+                params.append(checkpoint_id)
+                
+                query = f"UPDATE scheduler_checkpoints SET {', '.join(set_clauses)} WHERE id = ?"
+                conn.execute(query, params)
+        
+        self.execute_with_retry(_update)
+    
+    def batch_insert_schedules_transactional(self, schedules: List[Dict[str, Any]]):
+        """Batch insert email schedules with full transaction management"""
         if not schedules:
             return
         
-        with sqlite3.connect(self.db_path) as conn:
-            conn.executemany("""
-                INSERT OR IGNORE INTO email_schedules 
-                (contact_id, email_type, scheduled_send_date, scheduled_send_time, 
-                 status, skip_reason, priority, campaign_instance_id, email_template, 
-                 sms_template, scheduler_run_id, event_year, event_month, event_day)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                (s['contact_id'], s['email_type'], s['scheduled_send_date'], 
-                 s['scheduled_send_time'], s['status'], s.get('skip_reason'),
-                 s.get('priority', 10), s.get('campaign_instance_id'),
-                 s.get('email_template'), s.get('sms_template'), 
-                 s['scheduler_run_id'], s.get('event_year'), s.get('event_month'), 
-                 s.get('event_day'))
-                for s in schedules
-            ])
-            
-            logger.info(f"Inserted {len(schedules)} email schedules")
+        def _insert():
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.executemany("""
+                        INSERT OR IGNORE INTO email_schedules 
+                        (contact_id, email_type, scheduled_send_date, scheduled_send_time, 
+                         status, skip_reason, priority, campaign_instance_id, email_template, 
+                         sms_template, scheduler_run_id, event_year, event_month, event_day)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        (s['contact_id'], s['email_type'], s['scheduled_send_date'], 
+                         s['scheduled_send_time'], s['status'], s.get('skip_reason'),
+                         s.get('priority', 10), s.get('campaign_instance_id'),
+                         s.get('email_template'), s.get('sms_template'), 
+                         s['scheduler_run_id'], s.get('event_year'), s.get('event_month'), 
+                         s.get('event_day'))
+                        for s in schedules
+                    ])
+                    conn.execute("COMMIT")
+                    logger.info(f"Transactionally inserted {len(schedules)} email schedules")
+                    
+                except Exception as e:
+                    conn.execute("ROLLBACK")
+                    logger.error(f"Transaction rolled back due to error: {e}")
+                    raise
+        
+        self.execute_with_retry(_insert)
 
 # ============================================================================
 # ANNIVERSARY EMAIL SCHEDULER - HANDLES BIRTHDAY, EFFECTIVE DATE, AEP
@@ -806,6 +901,231 @@ class AnniversaryEmailScheduler:
         }
 
 # ============================================================================
+# LOAD BALANCING AND SMOOTHING ENGINE
+# ============================================================================
+
+class LoadBalancer:
+    """Load balancing and smoothing engine for email distribution"""
+    
+    def __init__(self, config: LoadBalancingConfig):
+        self.config = config
+    
+    def apply_load_balancing(self, schedules: List[Dict[str, Any]], total_contacts: int) -> List[Dict[str, Any]]:
+        """Apply load balancing and smoothing to email schedules"""
+        if not schedules:
+            return schedules
+        
+        logger.info(f"Applying load balancing to {len(schedules)} schedules")
+        
+        # 1. Apply effective date smoothing first
+        smoothed_schedules = self.smooth_effective_date_emails(schedules)
+        
+        # 2. Apply global daily cap enforcement
+        balanced_schedules = self.enforce_daily_caps(smoothed_schedules, total_contacts)
+        
+        # 3. Distribute catch-up emails
+        final_schedules = self.distribute_catch_up_emails(balanced_schedules)
+        
+        logger.info(f"Load balancing complete: {len(final_schedules)} schedules")
+        return final_schedules
+    
+    def smooth_effective_date_emails(self, schedules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Smooth effective date email clustering using deterministic jitter"""
+        logger.info("Applying effective date smoothing")
+        
+        # Group schedules by date and email type
+        schedules_by_date = {}
+        for schedule in schedules:
+            send_date = schedule['scheduled_send_date']
+            if send_date not in schedules_by_date:
+                schedules_by_date[send_date] = []
+            schedules_by_date[send_date].append(schedule)
+        
+        smoothed_schedules = []
+        today = date.today()
+        
+        for send_date_str, date_schedules in schedules_by_date.items():
+            send_date = datetime.strptime(send_date_str, '%Y-%m-%d').date()
+            
+            # Count effective date emails for this date
+            ed_emails = [s for s in date_schedules if s['email_type'] == EmailType.EFFECTIVE_DATE.value]
+            ed_count = len(ed_emails)
+            
+            # Apply smoothing if ED limit exceeded
+            if ed_count > self.config.ed_daily_soft_limit:
+                logger.info(f"Smoothing {ed_count} effective date emails on {send_date_str}")
+                
+                # Apply jitter to ED emails
+                for schedule in ed_emails:
+                    jittered_date = self._calculate_jittered_date(
+                        schedule, send_date, self.config.ed_smoothing_window_days
+                    )
+                    
+                    # Ensure date is not in the past
+                    if jittered_date < today:
+                        jittered_date = today + timedelta(days=1)
+                    
+                    schedule['scheduled_send_date'] = jittered_date.isoformat()
+                    schedule['load_balancing_applied'] = True
+                    schedule['original_send_date'] = send_date_str
+                
+                # Add non-ED emails unchanged
+                non_ed_emails = [s for s in date_schedules if s['email_type'] != EmailType.EFFECTIVE_DATE.value]
+                smoothed_schedules.extend(non_ed_emails)
+                smoothed_schedules.extend(ed_emails)
+            else:
+                # No smoothing needed
+                smoothed_schedules.extend(date_schedules)
+        
+        return smoothed_schedules
+    
+    def enforce_daily_caps(self, schedules: List[Dict[str, Any]], total_contacts: int) -> List[Dict[str, Any]]:
+        """Enforce global daily email caps with redistribution"""
+        logger.info("Enforcing daily caps")
+        
+        # Calculate daily cap
+        daily_cap = int(total_contacts * self.config.daily_send_percentage_cap)
+        overage_threshold = int(daily_cap * self.config.overage_threshold)
+        
+        logger.info(f"Daily cap: {daily_cap}, Overage threshold: {overage_threshold}")
+        
+        # Group schedules by date
+        schedules_by_date = {}
+        for schedule in schedules:
+            send_date = schedule['scheduled_send_date']
+            if send_date not in schedules_by_date:
+                schedules_by_date[send_date] = []
+            schedules_by_date[send_date].append(schedule)
+        
+        # Sort dates for processing
+        sorted_dates = sorted(schedules_by_date.keys())
+        balanced_schedules = []
+        
+        for send_date_str in sorted_dates:
+            date_schedules = schedules_by_date[send_date_str]
+            
+            if len(date_schedules) > overage_threshold:
+                logger.info(f"Redistributing {len(date_schedules)} emails from {send_date_str}")
+                
+                # Keep emails up to daily cap
+                keep_schedules = date_schedules[:daily_cap]
+                overflow_schedules = date_schedules[daily_cap:]
+                
+                # Redistribute overflow to next available days
+                redistributed = self._redistribute_overflow(
+                    overflow_schedules, send_date_str, sorted_dates, schedules_by_date, daily_cap
+                )
+                
+                balanced_schedules.extend(keep_schedules)
+                balanced_schedules.extend(redistributed)
+            else:
+                balanced_schedules.extend(date_schedules)
+        
+        return balanced_schedules
+    
+    def distribute_catch_up_emails(self, schedules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Distribute catch-up emails across window to prevent clustering"""
+        logger.info("Distributing catch-up emails")
+        
+        today = date.today()
+        catch_up_schedules = []
+        regular_schedules = []
+        
+        # Separate catch-up emails (those with past send dates)
+        for schedule in schedules:
+            send_date = datetime.strptime(schedule['scheduled_send_date'], '%Y-%m-%d').date()
+            
+            # Check if this is a catch-up email (past due but event still future)
+            if send_date < today:
+                event_date = None
+                if schedule.get('event_year'):
+                    event_date = date(
+                        schedule['event_year'],
+                        schedule['event_month'],
+                        schedule['event_day']
+                    )
+                
+                # Only reschedule if event is still in the future
+                if event_date and event_date > today:
+                    catch_up_schedules.append(schedule)
+                else:
+                    # Event has passed, keep original schedule (will likely be skipped)
+                    regular_schedules.append(schedule)
+            else:
+                regular_schedules.append(schedule)
+        
+        # Distribute catch-up emails
+        if catch_up_schedules:
+            logger.info(f"Distributing {len(catch_up_schedules)} catch-up emails")
+            
+            for schedule in catch_up_schedules:
+                distributed_date = self._calculate_catch_up_date(schedule)
+                schedule['scheduled_send_date'] = distributed_date.isoformat()
+                schedule['catch_up_applied'] = True
+                schedule['original_send_date'] = schedule.get('original_send_date', schedule['scheduled_send_date'])
+        
+        return regular_schedules + catch_up_schedules
+    
+    def _calculate_jittered_date(self, schedule: Dict[str, Any], original_date: date, window_days: int) -> date:
+        """Calculate jittered date using deterministic hash"""
+        # Create deterministic hash input
+        hash_input = f"{schedule['contact_id']}_{schedule['email_type']}_{schedule.get('event_year', '')}"
+        hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+        
+        # Calculate jitter within window
+        total_window = window_days * 2 + 1  # ±window_days
+        jitter_offset = (hash_value % total_window) - window_days
+        
+        jittered_date = original_date + timedelta(days=jitter_offset)
+        return jittered_date
+    
+    def _calculate_catch_up_date(self, schedule: Dict[str, Any]) -> date:
+        """Calculate catch-up date using deterministic distribution"""
+        hash_input = f"{schedule['contact_id']}_{schedule['email_type']}_catchup"
+        hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+        
+        # Distribute across catch-up window starting tomorrow
+        day_offset = (hash_value % self.config.catch_up_spread_days) + 1
+        catch_up_date = date.today() + timedelta(days=day_offset)
+        
+        return catch_up_date
+    
+    def _redistribute_overflow(self, overflow_schedules: List[Dict[str, Any]], 
+                             original_date: str, sorted_dates: List[str],
+                             schedules_by_date: Dict[str, List], daily_cap: int) -> List[Dict[str, Any]]:
+        """Redistribute overflow emails to subsequent days"""
+        redistributed = []
+        current_date = datetime.strptime(original_date, '%Y-%m-%d').date()
+        
+        for schedule in overflow_schedules:
+            # Find next available day with capacity
+            next_date = current_date + timedelta(days=1)
+            
+            while True:
+                next_date_str = next_date.isoformat()
+                
+                # Count existing schedules for this date
+                existing_count = len(schedules_by_date.get(next_date_str, []))
+                
+                if existing_count < daily_cap:
+                    # Found available capacity
+                    schedule['scheduled_send_date'] = next_date_str
+                    schedule['redistributed_from'] = original_date
+                    
+                    # Update the tracking dictionary
+                    if next_date_str not in schedules_by_date:
+                        schedules_by_date[next_date_str] = []
+                    schedules_by_date[next_date_str].append(schedule)
+                    
+                    redistributed.append(schedule)
+                    break
+                else:
+                    # Try next day
+                    next_date += timedelta(days=1)
+        
+        return redistributed
+
+# ============================================================================
 # MAIN SCHEDULER ORCHESTRATOR
 # ============================================================================
 
@@ -830,6 +1150,67 @@ class EmailScheduler:
         
         logger.info(f"Email Scheduler initialized with run ID: {self.scheduler_run_id}")
     
+    def apply_frequency_limits(self, schedules: List[Dict[str, Any]], contact_id: int) -> List[Dict[str, Any]]:
+        """Apply email frequency limits to prevent overwhelming contacts"""
+        if not schedules:
+            return schedules
+        
+        # Query recent emails for this contact (excluding follow-ups from count)
+        lookback_date = date.today() - timedelta(days=self.config.load_balancing.period_days)
+        
+        with sqlite3.connect(self.db_manager.db_path) as conn:
+            cursor = conn.execute("""
+                SELECT COUNT(*) FROM email_schedules 
+                WHERE contact_id = ? 
+                AND scheduled_send_date >= ?
+                AND status IN ('pre-scheduled', 'scheduled', 'sent', 'delivered')
+                AND email_type NOT LIKE 'followup_%'
+            """, (contact_id, lookback_date.isoformat()))
+            
+            current_email_count = cursor.fetchone()[0]
+        
+        # Calculate available slots
+        max_emails = self.config.load_balancing.max_emails_per_contact_per_period
+        available_slots = max_emails - current_email_count
+        
+        if available_slots <= 0:
+            # Mark all as skipped
+            for schedule in schedules:
+                if not schedule['email_type'].startswith('followup_'):
+                    schedule['status'] = EmailStatus.SKIPPED.value
+                    schedule['skip_reason'] = 'frequency_limit_exceeded'
+            return schedules
+        
+        if len(schedules) <= available_slots:
+            # All schedules can be sent
+            return schedules
+        
+        # Need to prioritize - sort by priority (lower number = higher priority)
+        sorted_schedules = sorted(schedules, key=lambda x: x.get('priority', 10))
+        
+        # Keep high priority emails, skip the rest
+        kept_schedules = []
+        skipped_count = 0
+        
+        for i, schedule in enumerate(sorted_schedules):
+            if schedule['email_type'].startswith('followup_'):
+                # Always allow follow-ups
+                kept_schedules.append(schedule)
+            elif i < available_slots:
+                # Within limit
+                kept_schedules.append(schedule)
+            else:
+                # Over limit - skip
+                schedule['status'] = EmailStatus.SKIPPED.value
+                schedule['skip_reason'] = 'frequency_limit_exceeded'
+                kept_schedules.append(schedule)
+                skipped_count += 1
+        
+        if skipped_count > 0:
+            logger.info(f"Frequency limit applied to contact {contact_id}: {skipped_count} emails skipped")
+        
+        return kept_schedules
+
     def run_full_schedule(self):
         """Run complete scheduling process for all contacts"""
         logger.info("Starting full email scheduling process")
@@ -839,64 +1220,108 @@ class EmailScheduler:
         scheduled_count = 0
         skipped_count = 0
         
-        # Process contacts in batches
-        offset = 0
-        while offset < total_contacts:
-            batch_contacts = self.db_manager.get_contacts_batch(offset, self.config.batch_size)
-            if not batch_contacts:
-                break
+        # Create checkpoint for audit and recovery
+        checkpoint_id = self.db_manager.create_checkpoint(self.scheduler_run_id, total_contacts)
+        
+        try:
+            # Initialize load balancer
+            load_balancer = LoadBalancer(self.config.load_balancing)
             
-            logger.info(f"Processing batch: {offset} - {offset + len(batch_contacts)} of {total_contacts}")
-            
-            # Clear existing schedules for this batch
-            contact_ids = [c.id for c in batch_contacts]
-            self.db_manager.clear_scheduled_emails(contact_ids, self.scheduler_run_id)
-            
-            # Schedule emails for this batch
-            all_schedules = []
-            for contact in batch_contacts:
-                try:
-                    # Schedule anniversary-based emails
-                    anniversary_schedules = self.anniversary_scheduler.schedule_anniversary_emails(
-                        contact, self.scheduler_run_id
-                    )
-                    all_schedules.extend(anniversary_schedules)
-                    
-                    # Schedule campaign-based emails
-                    if self.campaign_scheduler:
-                        campaign_schedules = self.campaign_scheduler.schedule_campaign_emails(
+            # Process contacts in batches
+            offset = 0
+            while offset < total_contacts:
+                batch_contacts = self.db_manager.get_contacts_batch(offset, self.config.batch_size)
+                if not batch_contacts:
+                    break
+                
+                logger.info(f"Processing batch: {offset} - {offset + len(batch_contacts)} of {total_contacts}")
+                
+                # Clear existing schedules for this batch
+                contact_ids = [c.id for c in batch_contacts]
+                self.db_manager.clear_scheduled_emails(contact_ids, self.scheduler_run_id)
+                
+                # Schedule emails for this batch
+                all_schedules = []
+                for contact in batch_contacts:
+                    try:
+                        # Schedule anniversary-based emails
+                        anniversary_schedules = self.anniversary_scheduler.schedule_anniversary_emails(
                             contact, self.scheduler_run_id
                         )
-                        all_schedules.extend(campaign_schedules)
-                    
-                    processed_count += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing contact {contact.id}: {e}")
-                    continue
+                        
+                        # Schedule campaign-based emails
+                        campaign_schedules = []
+                        if self.campaign_scheduler:
+                            campaign_schedules = self.campaign_scheduler.schedule_campaign_emails(
+                                contact, self.scheduler_run_id
+                            )
+                        
+                        # Combine schedules for this contact
+                        contact_schedules = anniversary_schedules + campaign_schedules
+                        
+                        # Apply frequency limits
+                        limited_schedules = self.apply_frequency_limits(contact_schedules, contact.id)
+                        all_schedules.extend(limited_schedules)
+                        
+                        processed_count += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing contact {contact.id}: {e}")
+                        continue
+                
+                # Apply load balancing and smoothing
+                balanced_schedules = load_balancer.apply_load_balancing(all_schedules, total_contacts)
+                
+                # Count scheduled vs skipped
+                batch_scheduled = len([s for s in balanced_schedules if s['status'] == EmailStatus.PRE_SCHEDULED.value])
+                batch_skipped = len([s for s in balanced_schedules if s['status'] == EmailStatus.SKIPPED.value])
+                
+                scheduled_count += batch_scheduled
+                skipped_count += batch_skipped
+                
+                # Insert schedules into database with transaction management
+                self.db_manager.batch_insert_schedules_transactional(balanced_schedules)
+                
+                # Update checkpoint progress
+                self.db_manager.update_checkpoint(
+                    checkpoint_id, 
+                    'in_progress',
+                    contacts_processed=processed_count,
+                    emails_scheduled=scheduled_count,
+                    emails_skipped=skipped_count
+                )
+                
+                offset += len(batch_contacts)
             
-            # Apply load balancing and smoothing
-            # TODO: Implement load balancing logic
+            # Final checkpoint update
+            self.db_manager.update_checkpoint(
+                checkpoint_id,
+                'completed',
+                contacts_processed=processed_count,
+                emails_scheduled=scheduled_count,
+                emails_skipped=skipped_count
+            )
             
-            # Count scheduled vs skipped
-            batch_scheduled = len([s for s in all_schedules if s['status'] == EmailStatus.PRE_SCHEDULED.value])
-            batch_skipped = len([s for s in all_schedules if s['status'] == EmailStatus.SKIPPED.value])
+            logger.info(f"""
+            Scheduling complete:
+            - Contacts processed: {processed_count}
+            - Emails scheduled: {scheduled_count}
+            - Emails skipped: {skipped_count}
+            - Run ID: {self.scheduler_run_id}
+            """)
             
-            scheduled_count += batch_scheduled
-            skipped_count += batch_skipped
-            
-            # Insert schedules into database
-            self.db_manager.batch_insert_schedules(all_schedules)
-            
-            offset += len(batch_contacts)
-        
-        logger.info(f"""
-        Scheduling complete:
-        - Contacts processed: {processed_count}
-        - Emails scheduled: {scheduled_count}
-        - Emails skipped: {skipped_count}
-        - Run ID: {self.scheduler_run_id}
-        """)
+        except Exception as e:
+            # Update checkpoint with error
+            self.db_manager.update_checkpoint(
+                checkpoint_id,
+                'failed',
+                error_message=str(e),
+                contacts_processed=processed_count,
+                emails_scheduled=scheduled_count,
+                emails_skipped=skipped_count
+            )
+            logger.error(f"Scheduling failed: {e}")
+            raise
     
     def schedule_for_contact(self, contact_id: int) -> List[Dict[str, Any]]:
         """Schedule emails for a specific contact (useful for testing)"""

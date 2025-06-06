@@ -57,8 +57,8 @@ class CampaignEmailScheduler:
                 )
                 self._campaign_types_cache[campaign_type.name] = campaign_type
     
-    def schedule_campaign_emails(self, contact: Contact, scheduler_run_id: str) -> List[Dict[str, Any]]:
-        """Schedule all campaign-based emails for a contact"""
+    def schedule_all_campaign_emails(self, scheduler_run_id: str) -> List[Dict[str, Any]]:
+        """Schedule all campaign-based emails for a scheduler run."""
         schedules = []
         current_date = date.today()
         
@@ -67,16 +67,16 @@ class CampaignEmailScheduler:
         if not active_instances:
             return schedules
         
-        # Get contact campaigns for active instances
+        # Get all targeted contact campaigns for active instances
         instance_ids = [instance.id for instance in active_instances if instance.id]
-        contact_campaigns = self._get_contact_campaigns_for_contact(contact.id, instance_ids)
+        targeted_campaigns = self._get_targeted_contact_campaigns(instance_ids)
         
-        # Schedule emails for each contact campaign
-        for contact_campaign in contact_campaigns:
-            campaign_instance = next(
-                (inst for inst in active_instances if inst.id == contact_campaign.campaign_instance_id),
-                None
-            )
+        # Create a lookup for campaign instances by ID
+        instances_by_id = {inst.id: inst for inst in active_instances}
+        
+        # Schedule emails for each targeted contact campaign
+        for campaign_data in targeted_campaigns:
+            campaign_instance = instances_by_id.get(campaign_data['campaign_instance_id'])
             if not campaign_instance:
                 continue
             
@@ -84,13 +84,33 @@ class CampaignEmailScheduler:
             if not campaign_type:
                 logger.warning(f"Campaign type {campaign_instance.campaign_type} not found")
                 continue
+
+            # Create Contact and ContactCampaign objects from the joined data
+            contact = Contact(
+                id=campaign_data['contact_id'],
+                email=campaign_data['email'],
+                state=campaign_data['state'],
+                zip_code=campaign_data['zip_code'],
+                birthday=datetime.strptime(campaign_data['birth_date'], '%Y-%m-%d').date() if campaign_data['birth_date'] else None,
+                effective_date=datetime.strptime(campaign_data['effective_date'], '%Y-%m-%d').date() if campaign_data['effective_date'] else None,
+                phone_number=campaign_data['phone_number']
+            )
             
+            contact_campaign = ContactCampaign(
+                contact_id=campaign_data['contact_id'],
+                campaign_instance_id=campaign_data['campaign_instance_id'],
+                trigger_date=datetime.strptime(campaign_data['trigger_date'], '%Y-%m-%d').date(),
+                status=campaign_data['status'],
+                metadata=json.loads(campaign_data['cc_metadata']) if campaign_data['cc_metadata'] else {}
+            )
+
             schedule = self._schedule_campaign_email(
                 contact, contact_campaign, campaign_instance, campaign_type, scheduler_run_id
             )
             if schedule:
                 schedules.append(schedule)
         
+        logger.info(f"Scheduled {len(schedules)} campaign emails.")
         return schedules
     
     def _get_active_campaign_instances(self, current_date: date) -> List[CampaignInstance]:
@@ -124,34 +144,39 @@ class CampaignEmailScheduler:
             
             return instances
     
-    def _get_contact_campaigns_for_contact(self, contact_id: int, instance_ids: List[int]) -> List[ContactCampaign]:
-        """Get contact campaign targeting data for a specific contact"""
+    def _get_targeted_contact_campaigns(self, instance_ids: List[int]) -> List[Dict[str, Any]]:
+        """
+        Get all contact campaign targeting data for a set of campaign instances,
+        joined with contact information.
+        """
         if not instance_ids:
             return []
         
         placeholders = ','.join('?' * len(instance_ids))
+        query = f"""
+            SELECT 
+                cc.contact_id, 
+                cc.campaign_instance_id, 
+                cc.trigger_date, 
+                cc.status, 
+                cc.metadata as cc_metadata,
+                c.email,
+                c.state,
+                c.zip_code,
+                c.birth_date,
+                c.effective_date,
+                c.phone_number
+            FROM contact_campaigns cc
+            JOIN contacts c ON c.id = cc.contact_id
+            WHERE cc.campaign_instance_id IN ({placeholders})
+              AND cc.status = 'pending'
+        """
+        
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(f"""
-                SELECT contact_id, campaign_instance_id, trigger_date, status, metadata
-                FROM contact_campaigns
-                WHERE contact_id = ? AND campaign_instance_id IN ({placeholders})
-                AND status = 'pending'
-            """, [contact_id] + instance_ids)
+            cursor = conn.execute(query, instance_ids)
             
-            campaigns = []
-            for row in cursor.fetchall():
-                row_dict = dict(row)
-                campaign = ContactCampaign(
-                    contact_id=row_dict['contact_id'],
-                    campaign_instance_id=row_dict['campaign_instance_id'],
-                    trigger_date=datetime.strptime(row_dict['trigger_date'], '%Y-%m-%d').date(),
-                    status=row_dict['status'],
-                    metadata=json.loads(row_dict['metadata']) if row_dict['metadata'] else {}
-                )
-                campaigns.append(campaign)
-            
-            return campaigns
+            return [dict(row) for row in cursor.fetchall()]
     
     def _schedule_campaign_email(self, contact: Contact, contact_campaign: ContactCampaign,
                                campaign_instance: CampaignInstance, campaign_type: CampaignType,

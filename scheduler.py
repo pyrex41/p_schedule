@@ -282,12 +282,17 @@ class StateRulesEngine:
     
     def get_state_rule(self, state_code: str) -> Optional[StateRule]:
         """Get state rule for a given state code"""
+        if not state_code:
+            return None
         return self.state_rules.get(state_code.upper())
     
     def is_date_excluded(self, state_code: str, check_date: date, 
                         contact_birthday: Optional[date] = None,
                         contact_effective_date: Optional[date] = None) -> Tuple[bool, Optional[str]]:
         """Check if a date is excluded for a contact in a specific state"""
+        if not state_code:
+            return False, "No state specified"
+        
         rule = self.get_state_rule(state_code)
         if not rule:
             return False, None  # No rules = no exclusion
@@ -383,7 +388,8 @@ class DatabaseManager:
                 'email_template': 'TEXT',
                 'sms_template': 'TEXT',
                 'scheduler_run_id': 'TEXT',
-                'actual_send_datetime': 'TEXT'
+                'actual_send_datetime': 'TEXT',
+                'metadata': 'TEXT'
             }
             
             for col_name, col_def in required_columns.items():
@@ -518,7 +524,9 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_contact_campaigns_contact ON contact_campaigns(contact_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_contact_campaigns_instance ON contact_campaigns(campaign_instance_id, status)",
             "CREATE INDEX IF NOT EXISTS idx_checkpoints_run_id ON scheduler_checkpoints(scheduler_run_id)",
-            "CREATE INDEX IF NOT EXISTS idx_checkpoints_timestamp ON scheduler_checkpoints(run_timestamp)"
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_timestamp ON scheduler_checkpoints(run_timestamp)",
+            # Add the new unique index for conflict resolution
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_email_schedules_unique_event ON email_schedules(contact_id, email_type, event_year)"
         ]
         
         for index_sql in indexes:
@@ -694,38 +702,115 @@ class DatabaseManager:
         self.execute_with_retry(_update)
     
     def batch_insert_schedules_transactional(self, schedules: List[Dict[str, Any]]):
-        """Batch insert email schedules with full transaction management"""
+        """
+        Batch insert/update email schedules with full transaction management using
+        a robust ON CONFLICT DO UPDATE strategy.
+        """
         if not schedules:
             return
-        
-        def _insert():
+
+        def _insert_update():
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.cursor()
+                
+                script_parts = ["BEGIN TRANSACTION;"]
+                
+                for s in schedules:
+                    # Safely escape string values for SQL
+                    def format_sql_literal(value):
+                        if value is None: return "NULL"
+                        if isinstance(value, (int, float, bool)): return str(value)
+                        escaped = str(value).replace("'", "''")
+                        return f"'{escaped}'"
+
+                    sql = f"""
+                        INSERT INTO email_schedules (
+                            contact_id, email_type, event_year, event_month, event_day,
+                            scheduled_send_date, scheduled_send_time, status, skip_reason, 
+                            priority, campaign_instance_id, email_template, sms_template, 
+                            scheduler_run_id, metadata
+                        )
+                        VALUES (
+                            {s['contact_id']},
+                            {format_sql_literal(s['email_type'])},
+                            {format_sql_literal(s.get('event_year'))},
+                            {format_sql_literal(s.get('event_month'))},
+                            {format_sql_literal(s.get('event_day'))},
+                            {format_sql_literal(s['scheduled_send_date'])},
+                            {format_sql_literal(s['scheduled_send_time'])},
+                            {format_sql_literal(s['status'])},
+                            {format_sql_literal(s.get('skip_reason'))},
+                            {s.get('priority', 10)},
+                            {format_sql_literal(s.get('campaign_instance_id'))},
+                            {format_sql_literal(s.get('email_template'))},
+                            {format_sql_literal(s.get('sms_template'))},
+                            {format_sql_literal(s['scheduler_run_id'])},
+                            {format_sql_literal(s.get('metadata'))}
+                        )
+                        ON CONFLICT(contact_id, email_type, event_year) DO UPDATE SET
+                            scheduled_send_date = excluded.scheduled_send_date,
+                            scheduled_send_time = excluded.scheduled_send_time,
+                            status              = excluded.status,
+                            skip_reason         = excluded.skip_reason,
+                            priority            = excluded.priority,
+                            metadata            = excluded.metadata,
+                            event_month         = excluded.event_month,
+                            event_day           = excluded.event_day
+                        WHERE email_schedules.status NOT IN ('sent', 'delivered', 'processing', 'accepted');
+                    """
+                    script_parts.append(sql)
+
+                script_parts.append("COMMIT;")
+                batch_script = "\n".join(script_parts)
+                
                 try:
-                    conn.executemany("""
-                        INSERT OR IGNORE INTO email_schedules 
-                        (contact_id, email_type, scheduled_send_date, scheduled_send_time, 
-                         status, skip_reason, priority, campaign_instance_id, email_template, 
-                         sms_template, scheduler_run_id, event_year, event_month, event_day)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        (s['contact_id'], s['email_type'], s['scheduled_send_date'], 
-                         s['scheduled_send_time'], s['status'], s.get('skip_reason'),
-                         s.get('priority', 10), s.get('campaign_instance_id'),
-                         s.get('email_template'), s.get('sms_template'), 
-                         s['scheduler_run_id'], s.get('event_year'), s.get('event_month'), 
-                         s.get('event_day'))
-                        for s in schedules
-                    ])
-                    conn.execute("COMMIT")
-                    logger.info(f"Transactionally inserted {len(schedules)} email schedules")
-                    
+                    cursor.executescript(batch_script)
+                    logger.info(f"Transactionally inserted/updated {len(schedules)} email schedules")
                 except Exception as e:
-                    conn.execute("ROLLBACK")
+                    conn.rollback()
                     logger.error(f"Transaction rolled back due to error: {e}")
                     raise
+
+        self.execute_with_retry(_insert_update)
+
+    def get_contacts_in_scheduling_window(self, lookahead_days: int, lookback_days: int) -> List[Contact]:
+        """
+        Efficiently fetches contacts from the database who might need scheduled emails
+        in the current active window using a single optimized query.
+        """
+        today = date.today()
+        active_window_end = today + timedelta(days=lookahead_days)
+        lookback_window_start = today - timedelta(days=lookback_days)
         
-        self.execute_with_retry(_insert)
+        # Format dates for SQL
+        today_str = today.strftime("%m-%d")
+        future_end_str = active_window_end.strftime("%m-%d")
+        past_start_str = lookback_window_start.strftime("%m-%d")
+
+        # This query is complex but highly performant. It finds contacts with an anniversary
+        # (birthday or effective date) within the lookahead/lookback window.
+        # It handles year rollovers correctly.
+        sql = f"""
+            SELECT id, email, zip_code, state, birth_date, effective_date, first_name, last_name, phone_number
+            FROM contacts
+            WHERE
+                (
+                    (strftime('%m-%d', birth_date) BETWEEN '{past_start_str}' AND '12-31') OR
+                    (strftime('%m-%d', birth_date) BETWEEN '01-01' AND '{future_end_str}')
+                )
+                OR
+                (
+                    (strftime('%m-%d', effective_date) BETWEEN '{past_start_str}' AND '12-31') OR
+                    (strftime('%m-%d', effective_date) BETWEEN '01-01' AND '{future_end_str}')
+                )
+        """
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(sql)
+            contacts = [Contact.from_db_row(dict(row)) for row in cursor.fetchall() if row]
+            logger.info(f"Found {len(contacts)} contacts with potential anniversary events in the scheduling window.")
+            return contacts
 
 # ============================================================================
 # ANNIVERSARY EMAIL SCHEDULER - HANDLES BIRTHDAY, EFFECTIVE DATE, AEP
@@ -738,27 +823,42 @@ class AnniversaryEmailScheduler:
         self.config = config
         self.state_rules = state_rules
     
-    def schedule_anniversary_emails(self, contact: Contact, scheduler_run_id: str) -> List[Dict[str, Any]]:
-        """Schedule all anniversary-based emails for a contact"""
+    def schedule_all_anniversary_emails(self, contacts: List[Contact], scheduler_run_id: str) -> List[Dict[str, Any]]:
+        """
+        Generates all potential anniversary-based schedules for a pre-filtered list of contacts.
+        """
+        all_schedules = []
+        for contact in contacts:
+            schedules = self._generate_schedules_for_contact(contact, scheduler_run_id)
+            all_schedules.extend(schedules)
+        logger.info(f"Generated {len(all_schedules)} potential anniversary schedules.")
+        return all_schedules
+
+    def _generate_schedules_for_contact(self, contact: Contact, scheduler_run_id: str) -> List[Dict[str, Any]]:
+        """Generate all anniversary-based emails for a single contact."""
         schedules = []
-        current_year = datetime.now().year
+        current_year = date.today().year
         
-        # Birthday emails
-        if contact.birthday:
-            birthday_schedule = self._schedule_birthday_email(contact, current_year, scheduler_run_id)
-            if birthday_schedule:
-                schedules.append(birthday_schedule)
+        # Years to check: current and next year for forward planning
+        years_to_check = [current_year, current_year + 1]
         
-        # Effective date emails
-        if contact.effective_date:
-            ed_schedule = self._schedule_effective_date_email(contact, current_year, scheduler_run_id)
-            if ed_schedule:
-                schedules.append(ed_schedule)
-        
-        # AEP emails
-        aep_schedule = self._schedule_aep_email(contact, current_year, scheduler_run_id)
-        if aep_schedule:
-            schedules.append(aep_schedule)
+        for year in years_to_check:
+            # Birthday emails
+            if contact.birthday:
+                birthday_schedule = self._schedule_birthday_email(contact, year, scheduler_run_id)
+                if birthday_schedule:
+                    schedules.append(birthday_schedule)
+            
+            # Effective date emails
+            if contact.effective_date:
+                ed_schedule = self._schedule_effective_date_email(contact, year, scheduler_run_id)
+                if ed_schedule:
+                    schedules.append(ed_schedule)
+            
+            # AEP emails
+            aep_schedule = self._schedule_aep_email(contact, year, scheduler_run_id)
+            if aep_schedule:
+                schedules.append(aep_schedule)
         
         # Post-window emails (if any emails were skipped)
         skipped_schedules = [s for s in schedules if s['status'] == EmailStatus.SKIPPED.value]
@@ -1137,6 +1237,7 @@ class EmailScheduler:
         self.config = SchedulingConfig.from_yaml(config_path) if config_path else SchedulingConfig()
         self.state_rules = StateRulesEngine()
         self.anniversary_scheduler = AnniversaryEmailScheduler(self.config, self.state_rules)
+        self.load_balancer = LoadBalancer(self.config.load_balancing)
         
         # Import and initialize campaign scheduler
         try:
@@ -1212,11 +1313,10 @@ class EmailScheduler:
         return kept_schedules
 
     def run_full_schedule(self):
-        """Run complete scheduling process for all contacts"""
+        """Run complete scheduling process for all contacts using a high-performance, query-driven approach."""
         logger.info("Starting full email scheduling process")
         
         total_contacts = self.db_manager.get_total_contact_count()
-        processed_count = 0
         scheduled_count = 0
         skipped_count = 0
         
@@ -1224,89 +1324,55 @@ class EmailScheduler:
         checkpoint_id = self.db_manager.create_checkpoint(self.scheduler_run_id, total_contacts)
         
         try:
-            # Initialize load balancer
-            load_balancer = LoadBalancer(self.config.load_balancing)
-            
-            # Process contacts in batches
-            offset = 0
-            while offset < total_contacts:
-                batch_contacts = self.db_manager.get_contacts_batch(offset, self.config.batch_size)
-                if not batch_contacts:
-                    break
-                
-                logger.info(f"Processing batch: {offset} - {offset + len(batch_contacts)} of {total_contacts}")
-                
-                # Clear existing schedules for this batch
-                contact_ids = [c.id for c in batch_contacts]
-                self.db_manager.clear_scheduled_emails(contact_ids, self.scheduler_run_id)
-                
-                # Schedule emails for this batch
-                all_schedules = []
-                for contact in batch_contacts:
-                    try:
-                        # Schedule anniversary-based emails
-                        anniversary_schedules = self.anniversary_scheduler.schedule_anniversary_emails(
-                            contact, self.scheduler_run_id
-                        )
-                        
-                        # Schedule campaign-based emails
-                        campaign_schedules = []
-                        if self.campaign_scheduler:
-                            campaign_schedules = self.campaign_scheduler.schedule_campaign_emails(
-                                contact, self.scheduler_run_id
-                            )
-                        
-                        # Combine schedules for this contact
-                        contact_schedules = anniversary_schedules + campaign_schedules
-                        
-                        # Apply frequency limits
-                        limited_schedules = self.apply_frequency_limits(contact_schedules, contact.id)
-                        all_schedules.extend(limited_schedules)
-                        
-                        processed_count += 1
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing contact {contact.id}: {e}")
-                        continue
-                
-                # Apply load balancing and smoothing
-                balanced_schedules = load_balancer.apply_load_balancing(all_schedules, total_contacts)
-                
-                # Count scheduled vs skipped
-                batch_scheduled = len([s for s in balanced_schedules if s['status'] == EmailStatus.PRE_SCHEDULED.value])
-                batch_skipped = len([s for s in balanced_schedules if s['status'] == EmailStatus.SKIPPED.value])
-                
-                scheduled_count += batch_scheduled
-                skipped_count += batch_skipped
-                
-                # Insert schedules into database with transaction management
-                self.db_manager.batch_insert_schedules_transactional(balanced_schedules)
-                
-                # Update checkpoint progress
-                self.db_manager.update_checkpoint(
-                    checkpoint_id, 
-                    'in_progress',
-                    contacts_processed=processed_count,
-                    emails_scheduled=scheduled_count,
-                    emails_skipped=skipped_count
+            # 1. Fetch relevant contacts for anniversary emails
+            # This is the core performance improvement: query-driven pre-filtering.
+            relevant_contacts = self.db_manager.get_contacts_in_scheduling_window(
+                lookahead_days=30, lookback_days=7
+            )
+
+            # 2. Generate all potential anniversary schedules from the small, relevant contact list.
+            anniversary_schedules = self.anniversary_scheduler.schedule_all_anniversary_emails(
+                relevant_contacts, self.scheduler_run_id
+            )
+
+            # 3. Generate all campaign schedules (this is now also a batch operation).
+            campaign_schedules = []
+            if self.campaign_scheduler:
+                campaign_schedules = self.campaign_scheduler.schedule_all_campaign_emails(
+                    self.scheduler_run_id
                 )
-                
-                offset += len(batch_contacts)
+            
+            # 4. Combine all potential schedules.
+            all_schedules = anniversary_schedules + campaign_schedules
+            
+            # 5. Apply load balancing to the entire batch of schedules.
+            balanced_schedules = self.load_balancer.apply_load_balancing(all_schedules, total_contacts)
+            
+            # 6. Update final counts
+            for s in balanced_schedules:
+                if s['status'] == EmailStatus.SKIPPED.value:
+                    skipped_count += 1
+                else:
+                    scheduled_count += 1
+            
+            # 7. Insert schedules into database with robust transaction management.
+            if balanced_schedules:
+                self.db_manager.batch_insert_schedules_transactional(balanced_schedules)
             
             # Final checkpoint update
             self.db_manager.update_checkpoint(
                 checkpoint_id,
                 'completed',
-                contacts_processed=processed_count,
+                contacts_processed=total_contacts, # This is now a conceptual number
                 emails_scheduled=scheduled_count,
                 emails_skipped=skipped_count
             )
             
             logger.info(f"""
             Scheduling complete:
-            - Contacts processed: {processed_count}
-            - Emails scheduled: {scheduled_count}
-            - Emails skipped: {skipped_count}
+            - Relevant contacts considered: {len(relevant_contacts)}
+            - Total emails scheduled: {scheduled_count}
+            - Total emails skipped: {skipped_count}
             - Run ID: {self.scheduler_run_id}
             """)
             
@@ -1316,7 +1382,6 @@ class EmailScheduler:
                 checkpoint_id,
                 'failed',
                 error_message=str(e),
-                contacts_processed=processed_count,
                 emails_scheduled=scheduled_count,
                 emails_skipped=skipped_count
             )

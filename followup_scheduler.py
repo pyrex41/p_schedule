@@ -12,34 +12,19 @@ import json
 import logging
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
 from scheduler import (
-    EmailType, EmailStatus, SchedulingConfig, StateRulesEngine, 
-    Contact, DatabaseManager
+    SchedulingConfig, StateRulesEngine, Contact, DatabaseManager
 )
+from src.config_loader import get_campaign_types_allowing_followups
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# FOLLOW-UP BEHAVIOR ANALYSIS
-# ============================================================================
+# Configuration
+FOLLOW_UP_DELAY_DAYS = 2  # Days after initial email to schedule follow-up
+LOOK_BACK_DAYS = 35  # How many days to look back for emails needing follow-ups
+STANDARD_SEND_TIME = "08:45:00"  # Default send time
 
-@dataclass
-class FollowupBehavior:
-    """Data structure for tracking user behavior and follow-up decisions"""
-    contact_id: int
-    initial_email_id: int
-    initial_email_type: str
-    has_clicked: bool = False
-    has_answered_hq: bool = False
-    has_medical_conditions: bool = False
-    followup_type: str = "followup_1_cold"
-    decision_reason: str = "no_engagement"
-    metadata: Dict[str, Any] = None
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+INITIAL_EMAIL_TYPES_FOR_FOLLOWUP = get_campaign_types_allowing_followups()
 
 # ============================================================================
 # FOLLOW-UP EMAIL SCHEDULER
@@ -65,13 +50,12 @@ class FollowupEmailScheduler:
                 CREATE TABLE IF NOT EXISTS tracking_clicks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     contact_id INTEGER NOT NULL,
-                    email_schedule_id INTEGER,
+                    tracking_id TEXT,
                     clicked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     url TEXT,
                     ip_address TEXT,
                     user_agent TEXT,
-                    FOREIGN KEY (contact_id) REFERENCES contacts(id),
-                    FOREIGN KEY (email_schedule_id) REFERENCES email_schedules(id)
+                    FOREIGN KEY (contact_id) REFERENCES contacts(id)
                 )
             """)
             
@@ -81,324 +65,300 @@ class FollowupEmailScheduler:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     contact_id INTEGER NOT NULL,
                     event_type TEXT NOT NULL,
-                    event_data TEXT,
+                    metadata TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (contact_id) REFERENCES contacts(id)
                 )
             """)
             
-            # Create follow-up processing log
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS followup_processing_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scheduler_run_id TEXT NOT NULL,
-                    initial_email_id INTEGER NOT NULL,
-                    contact_id INTEGER NOT NULL,
-                    followup_type TEXT NOT NULL,
-                    behavior_analysis TEXT,
-                    processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (initial_email_id) REFERENCES email_schedules(id),
-                    FOREIGN KEY (contact_id) REFERENCES contacts(id),
-                    UNIQUE(initial_email_id, contact_id)
-                )
-            """)
-    
-    def schedule_followup_emails(self, lookback_days: int = 35) -> int:
-        """Main entry point for follow-up scheduling"""
-        logger.info(f"Starting follow-up email scheduling (lookback: {lookback_days} days)")
-        
-        # Generate unique run ID for this follow-up scheduling session
-        import uuid
-        scheduler_run_id = f"followup_{uuid.uuid4()}"
-        
-        # Get eligible initial emails
-        eligible_emails = self._get_eligible_initial_emails(lookback_days)
-        logger.info(f"Found {len(eligible_emails)} eligible initial emails for follow-up")
-        
-        if not eligible_emails:
-            return 0
-        
-        # Process follow-ups in batches
-        scheduled_count = 0
-        batch_size = 1000
-        
-        for i in range(0, len(eligible_emails), batch_size):
-            batch = eligible_emails[i:i + batch_size]
-            logger.info(f"Processing follow-up batch {i//batch_size + 1}: {len(batch)} emails")
-            
-            followup_schedules = []
-            
-            for email_data in batch:
-                try:
-                    # Analyze behavior and determine follow-up type
-                    behavior = self._analyze_contact_behavior(email_data)
-                    
-                    # Create follow-up schedule
-                    followup_schedule = self._create_followup_schedule(
-                        email_data, behavior, scheduler_run_id
-                    )
-                    
-                    if followup_schedule:
-                        followup_schedules.append(followup_schedule)
-                        
-                        # Log the processing
-                        self._log_followup_processing(email_data, behavior, scheduler_run_id)
-                
-                except Exception as e:
-                    logger.error(f"Error processing follow-up for email {email_data['id']}: {e}")
-                    continue
-            
-            # Insert follow-up schedules
-            if followup_schedules:
-                self.db_manager.batch_insert_schedules_transactional(followup_schedules)
-                scheduled_count += len(followup_schedules)
-        
-        logger.info(f"Follow-up scheduling complete: {scheduled_count} follow-ups scheduled")
-        return scheduled_count
-    
-    def _get_eligible_initial_emails(self, lookback_days: int) -> List[Dict[str, Any]]:
-        """Get initial emails eligible for follow-up scheduling"""
-        lookback_date = date.today() - timedelta(days=lookback_days)
-        
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            
-            # Query for sent/delivered initial emails
-            cursor = conn.execute("""
-                SELECT es.id, es.contact_id, es.email_type, es.scheduled_send_date,
-                       es.campaign_instance_id, es.priority, es.event_year, 
-                       es.event_month, es.event_day, c.state, c.birth_date, c.effective_date
-                FROM email_schedules es
-                JOIN contacts c ON es.contact_id = c.id
-                WHERE es.status IN ('sent', 'delivered')
-                AND es.scheduled_send_date >= ?
-                AND (
-                    -- Anniversary-based emails
-                    es.email_type IN ('birthday', 'effective_date', 'aep', 'post_window')
-                    OR 
-                    -- Campaign-based emails with followups enabled
-                    (es.email_type LIKE 'campaign_%' AND es.campaign_instance_id IN (
-                        SELECT ci.id FROM campaign_instances ci
-                        JOIN campaign_types ct ON ci.campaign_type = ct.name
-                        WHERE ct.enable_followups = TRUE
-                    ))
-                )
-                AND es.contact_id NOT IN (
-                    -- Exclude contacts with existing follow-ups
-                    SELECT DISTINCT contact_id 
-                    FROM email_schedules 
-                    WHERE email_type LIKE 'followup_%'
-                    AND status IN ('pre-scheduled', 'scheduled', 'sent', 'delivered')
-                )
-                ORDER BY es.scheduled_send_date DESC
-            """, (lookback_date.isoformat(),))
-            
-            return [dict(row) for row in cursor.fetchall()]
-    
-    def _analyze_contact_behavior(self, email_data: Dict[str, Any]) -> FollowupBehavior:
-        """Analyze contact behavior to determine appropriate follow-up type"""
-        contact_id = email_data['contact_id']
-        email_id = email_data['id']
-        
-        behavior = FollowupBehavior(
-            contact_id=contact_id,
-            initial_email_id=email_id,
-            initial_email_type=email_data['email_type']
-        )
-        
-        with sqlite3.connect(self.db_path) as conn:
-            # Check for clicks in the email_tracking table
-            click_cursor = conn.execute("""
-                SELECT COUNT(*) FROM email_tracking 
-                WHERE email_id = ? AND event_type = 'click'
-            """, (email_id,))
-            
-            click_count = click_cursor.fetchone()[0]
-            behavior.has_clicked = click_count > 0
-            
-            if behavior.has_clicked:
-                behavior.metadata['click_count'] = click_count
-            
-            # Check for health question responses in email_tracking
-            hq_cursor = conn.execute("""
-                SELECT COUNT(*) FROM email_tracking 
-                WHERE email_id = ? AND event_type = 'health_question_response'
-            """, (email_id,))
-            
-            hq_count = hq_cursor.fetchone()[0]
-            behavior.has_answered_hq = hq_count > 0
-            
-            if behavior.has_answered_hq:
-                # For simplicity, assume any health response indicates some medical interest
-                # In a real system, this would parse the actual response data
-                behavior.has_medical_conditions = True  # Simplified logic
-                behavior.metadata['hq_response_count'] = hq_count
-        
-        # Determine follow-up type based on behavior hierarchy
-        behavior.followup_type, behavior.decision_reason = self._determine_followup_type(behavior)
-        
-        return behavior
-    
-    def _determine_followup_type(self, behavior: FollowupBehavior) -> Tuple[str, str]:
-        """Determine the appropriate follow-up type based on user behavior"""
-        
-        # Priority order: Medical conditions > Healthy > Clicked > Cold
-        if behavior.has_answered_hq:
-            if behavior.has_medical_conditions:
-                return "followup_4_hq_with_yes", "answered_hq_with_conditions"
-            else:
-                return "followup_3_hq_no_yes", "answered_hq_no_conditions"
-        elif behavior.has_clicked:
-            return "followup_2_clicked_no_hq", "clicked_no_health_questions"
-        else:
-            return "followup_1_cold", "no_engagement"
-    
-    def _create_followup_schedule(self, email_data: Dict[str, Any], 
-                                behavior: FollowupBehavior, scheduler_run_id: str) -> Optional[Dict[str, Any]]:
-        """Create a follow-up email schedule based on behavior analysis"""
-        
-        # Calculate follow-up send date
-        initial_send_date = datetime.strptime(email_data['scheduled_send_date'], '%Y-%m-%d').date()
-        followup_send_date = initial_send_date + timedelta(days=self.config.followup_timing.days_before_event * -1)  # Convert to days after
-        
-        # If follow-up date is in the past, schedule for tomorrow
-        if followup_send_date <= date.today():
-            followup_send_date = date.today() + timedelta(days=1)
-        
-        # Get contact for state checking
-        contact = self._get_contact_by_id(behavior.contact_id)
-        if not contact:
-            logger.warning(f"Contact {behavior.contact_id} not found for follow-up")
-            return None
-        
-        # Check exclusion rules (follow-ups always respect exclusion windows)
-        is_excluded, skip_reason = self.state_rules.is_date_excluded(
-            contact.state, followup_send_date, contact.birthday, contact.effective_date
-        )
-        
-        # Determine priority (inherit from parent campaign or use default)
-        priority = email_data.get('priority', 10)
-        
-        # Prepare metadata with behavior analysis
-        metadata = {
-            'initial_email_id': behavior.initial_email_id,
-            'initial_email_type': behavior.initial_email_type,
-            'followup_behavior': {
-                'has_clicked': behavior.has_clicked,
-                'has_answered_hq': behavior.has_answered_hq,
-                'has_medical_conditions': behavior.has_medical_conditions,
-                'decision_reason': behavior.decision_reason
-            },
-            **behavior.metadata
-        }
-        
-        # Add campaign information if applicable
-        campaign_instance_id = None
-        if email_data.get('campaign_instance_id'):
-            campaign_instance_id = email_data['campaign_instance_id']
-            metadata['campaign_name'] = self._get_campaign_name(campaign_instance_id)
-        
-        return {
-            'contact_id': behavior.contact_id,
-            'email_type': behavior.followup_type,
-            'scheduled_send_date': followup_send_date.isoformat(),
-            'scheduled_send_time': self.config.send_time,
-            'status': EmailStatus.SKIPPED.value if is_excluded else EmailStatus.PRE_SCHEDULED.value,
-            'skip_reason': skip_reason,
-            'priority': priority,
-            'campaign_instance_id': campaign_instance_id,
-            'scheduler_run_id': scheduler_run_id,
-            'event_year': email_data.get('event_year'),
-            'event_month': email_data.get('event_month'),
-            'event_day': email_data.get('event_day'),
-            'metadata': json.dumps(metadata)
-        }
-    
-    def _get_contact_by_id(self, contact_id: int) -> Optional[Contact]:
-        """Get contact data by ID"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute("""
-                SELECT id, first_name, last_name, email, zip_code, state, 
-                       birth_date, effective_date, phone_number
-                FROM contacts 
-                WHERE id = ?
-            """, (contact_id,))
-            
-            row = cursor.fetchone()
-            if row:
-                return Contact.from_db_row(dict(row))
-            return None
-    
-    def _get_campaign_name(self, campaign_instance_id: int) -> Optional[str]:
-        """Get campaign name for metadata tracking"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("""
-                SELECT ci.instance_name, ct.name as campaign_type
-                FROM campaign_instances ci
-                JOIN campaign_types ct ON ci.campaign_type = ct.name
-                WHERE ci.id = ?
-            """, (campaign_instance_id,))
-            
-            row = cursor.fetchone()
-            if row:
-                return f"{row[1]}_{row[0]}"  # campaign_type_instance_name
-            return None
-    
-    def _log_followup_processing(self, email_data: Dict[str, Any], 
-                               behavior: FollowupBehavior, scheduler_run_id: str):
-        """Log follow-up processing for audit purposes"""
-        with sqlite3.connect(self.db_path) as conn:
-            behavior_summary = {
-                'followup_type': behavior.followup_type,
-                'decision_reason': behavior.decision_reason,
-                'has_clicked': behavior.has_clicked,
-                'has_answered_hq': behavior.has_answered_hq,
-                'has_medical_conditions': behavior.has_medical_conditions
-            }
-            
-            conn.execute("""
-                INSERT OR IGNORE INTO followup_processing_log
-                (scheduler_run_id, initial_email_id, contact_id, followup_type, behavior_analysis)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                scheduler_run_id,
-                behavior.initial_email_id,
-                behavior.contact_id,
-                behavior.followup_type,
-                json.dumps(behavior_summary)
-            ))
+            # Add indexes for performance
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tracking_clicks_contact_tracking ON tracking_clicks(contact_id, tracking_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_contact_events_contact_type ON contact_events(contact_id, event_type)")
 
-# ============================================================================
-# COMMAND LINE INTERFACE
-# ============================================================================
+    async def run_active_followup_scheduler(self, lookback_days: int = LOOK_BACK_DAYS, test_mode: bool = False) -> Dict[str, Any]:
+        """Main entry point for the active follow-up scheduler."""
+        logger.info(f"Starting active follow-up scheduling (lookback: {lookback_days} days)")
+        
+        stats = {
+            'emails_examined': 0,
+            'new_followups_scheduled': 0,
+            'followups_updated': 0,
+            'failures': 0,
+            'followup_types': {
+                'followup_1_cold': 0,
+                'followup_2_clicked_no_hq': 0,
+                'followup_3_hq_no_yes': 0,
+                'followup_4_hq_with_yes': 0
+            }
+        }
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=lookback_days)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            
+            initial_emails = await self._find_emails_needing_followups(conn, start_date, end_date)
+            stats['emails_examined'] = len(initial_emails)
+            logger.info(f"Found {len(initial_emails)} initial emails eligible for follow-up processing.")
+
+            if not initial_emails:
+                return stats
+
+            contact_ids = list(set(email['contact_id'] for email in initial_emails))
+            
+            # Batch fetch all data
+            contacts_data = await self._batch_fetch_contact_data(conn, contact_ids)
+            clicks_data = await self._batch_fetch_raw_click_data(conn, contact_ids)
+            hq_events_data = await self._batch_fetch_raw_hq_event_data(conn, contact_ids)
+
+            sql_statements_to_execute = []
+            
+            for email in initial_emails:
+                contact_id = email['contact_id']
+                if contact_id not in contacts_data:
+                    logger.warning(f"Contact {contact_id} not found for email {email['id']}. Skipping.")
+                    continue
+
+                followup_type, details = await self._determine_contact_followup_type(
+                    contact_id,
+                    email.get('tracking_uuid'),
+                    email['sent_time'],
+                    clicks_data.get(contact_id, []),
+                    hq_events_data.get(contact_id, [])
+                )
+
+                success, sql_statements = await self._schedule_or_update_followup(
+                    conn, email, followup_type, details, contacts_data[contact_id]
+                )
+
+                if success:
+                    sql_statements_to_execute.extend(sql_statements)
+                    if sql_statements:
+                        if "UPDATE" in sql_statements[0]:
+                           stats['followups_updated'] += 1
+                        else:
+                           stats['new_followups_scheduled'] += 1
+                        stats['followup_types'][followup_type.split('.')[0]] = stats['followup_types'].get(followup_type.split('.')[0], 0) + 1
+                else:
+                    stats['failures'] += 1
+            
+            if not test_mode and sql_statements_to_execute:
+                logger.info(f"Executing {len(sql_statements_to_execute)} SQL statements for follow-ups.")
+                cursor = conn.cursor()
+                try:
+                    cursor.execute("BEGIN;")
+                    for stmt in sql_statements_to_execute:
+                        cursor.execute(stmt)
+                    conn.commit()
+                except Exception as e:
+                    logger.error(f"Error executing batch follow-up SQL: {e}")
+                    conn.rollback()
+                    stats['failures'] += len(sql_statements_to_execute)
+
+            elif test_mode:
+                 logger.info(f"TEST MODE: Would execute {len(sql_statements_to_execute)} SQL statements.")
+
+        logger.info(f"Follow-up scheduling complete. Stats: {stats}")
+        return stats
+
+    async def _find_emails_needing_followups(self, conn: sqlite3.Connection, start_date: datetime, end_date: datetime) -> List[Dict[str, Any]]:
+        """Finds initial emails that need follow-ups scheduled."""
+        cursor = conn.cursor()
+        email_types_placeholders = ', '.join('?' * len(INITIAL_EMAIL_TYPES_FOR_FOLLOWUP))
+        
+        query = f"""
+            SELECT
+                es.id, es.contact_id, es.email_type,
+                COALESCE(es.actual_send_datetime, es.scheduled_send_date) as sent_time,
+                es.metadata, es.event_year,
+                json_extract(es.metadata, '$.tracking_uuid') as tracking_uuid
+            FROM email_schedules es
+            WHERE
+                es.status IN ('sent', 'delivered')
+                AND es.scheduled_send_date BETWEEN ? AND ?
+                AND LOWER(es.email_type) IN ({email_types_placeholders})
+                AND json_extract(COALESCE(es.metadata, '{{}}'), '$.followup_processed') IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM email_schedules es2
+                    WHERE es2.contact_id = es.contact_id
+                    AND es2.email_type LIKE 'followup_%'
+                    AND es2.event_year = es.event_year
+                )
+        """
+        
+        cursor.execute(query, (start_date.isoformat(), end_date.isoformat(), *INITIAL_EMAIL_TYPES_FOR_FOLLOWUP))
+        return [dict(row) for row in cursor.fetchall()]
+
+    async def _batch_fetch_contact_data(self, conn: sqlite3.Connection, contact_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Fetches contact details for a list of contact IDs."""
+        if not contact_ids:
+            return {}
+        placeholders = ', '.join('?' * len(contact_ids))
+        query = f"SELECT * FROM contacts WHERE id IN ({placeholders})"
+        cursor = conn.cursor()
+        cursor.execute(query, contact_ids)
+        return {row['id']: dict(row) for row in cursor.fetchall()}
+
+    async def _batch_fetch_raw_click_data(self, conn: sqlite3.Connection, contact_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+        """Fetches all tracking_clicks for a list of contact IDs."""
+        if not contact_ids:
+            return {}
+        clicks_by_contact = {cid: [] for cid in contact_ids}
+        placeholders = ', '.join('?' * len(contact_ids))
+        query = f"SELECT * FROM tracking_clicks WHERE contact_id IN ({placeholders}) ORDER BY clicked_at DESC"
+        cursor = conn.cursor()
+        cursor.execute(query, contact_ids)
+        for row in cursor.fetchall():
+            clicks_by_contact[row['contact_id']].append(dict(row))
+        return clicks_by_contact
+
+    async def _batch_fetch_raw_hq_event_data(self, conn: sqlite3.Connection, contact_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+        """Fetches 'eligibility_answered' contact_events for a list of contact IDs."""
+        if not contact_ids:
+            return {}
+        events_by_contact = {cid: [] for cid in contact_ids}
+        placeholders = ', '.join('?' * len(contact_ids))
+        query = f"SELECT * FROM contact_events WHERE contact_id IN ({placeholders}) AND event_type = 'eligibility_answered' ORDER BY created_at DESC"
+        cursor = conn.cursor()
+        cursor.execute(query, contact_ids)
+        for row in cursor.fetchall():
+            events_by_contact[row['contact_id']].append(dict(row))
+        return events_by_contact
+
+    async def _determine_contact_followup_type(
+        self, contact_id: int, tracking_uuid: str, initial_email_sent_at_iso: str,
+        contact_specific_clicks: List[Dict[str, Any]], contact_specific_hq_events: List[Dict[str, Any]]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Evaluate contact's current behavior and determine the appropriate follow-up type."""
+        clicked, latest_click_iso = self._get_click_status_from_prefetched(
+            contact_specific_clicks, tracking_uuid, initial_email_sent_at_iso
+        )
+        
+        hq_check_after_ts_iso = latest_click_iso or initial_email_sent_at_iso
+        
+        answered_hq, has_medical_conditions = self._get_hq_status_from_prefetched(
+            contact_id, contact_specific_hq_events, hq_check_after_ts_iso
+        )
+        
+        details = {
+            "clicked": clicked, "latest_click_time": latest_click_iso,
+            "answered_hq": answered_hq, "has_medical_conditions": has_medical_conditions
+        }
+        
+        if answered_hq:
+            return 'followup_4_hq_with_yes' if has_medical_conditions else 'followup_3_hq_no_yes', details
+        elif clicked:
+            return 'followup_2_clicked_no_hq', details
+        else:
+            return 'followup_1_cold', details
+
+    def _get_click_status_from_prefetched(
+        self, clicks: List[Dict[str, Any]], tracking_uuid: str, after_ts: str
+    ) -> Tuple[bool, Optional[str]]:
+        if not tracking_uuid: return False, None
+        for click in clicks:
+            if click['tracking_id'] == tracking_uuid and click['clicked_at'] > after_ts:
+                return True, click['clicked_at']
+        return False, None
+
+    def _get_hq_status_from_prefetched(
+        self, contact_id: int, hq_events: List[Dict[str, Any]], after_ts: str
+    ) -> Tuple[bool, Optional[bool]]:
+        for event in hq_events:
+            if event['created_at'] > after_ts:
+                try:
+                    metadata = json.loads(event['metadata'])
+                    if 'has_medical_conditions' in metadata:
+                        return True, bool(metadata['has_medical_conditions'])
+                    yes_count = metadata.get('main_questions_yes_count', 0)
+                    return True, yes_count > 0
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"Could not parse metadata for contact_event {event['id']}")
+                    return True, None
+        return False, None
+
+    async def _schedule_or_update_followup(
+        self, conn: sqlite3.Connection, email_data: Dict[str, Any], followup_type: str,
+        details: Dict[str, Any], contact_data: Dict[str, Any]
+    ) -> Tuple[bool, List[str]]:
+        """Create or update a follow-up schedule. Returns SQL statements."""
+        sql_statements = []
+        contact_id = email_data['contact_id']
+        event_year = email_data.get('event_year')
+
+        existing_id, existing_type = await self._get_existing_followup_schedule(conn, contact_id, event_year)
+
+        initial_sent_dt = datetime.fromisoformat(email_data['sent_time'].replace('Z', '+00:00'))
+        ideal_followup_date = (initial_sent_dt + timedelta(days=FOLLOW_UP_DELAY_DAYS)).date()
+        scheduled_send_date = max(ideal_followup_date, date.today()).isoformat()
+
+        metadata = {
+            'initial_email_id': email_data['id'],
+            'initial_email_type': email_data['email_type'],
+            'followup_behavior': details,
+            'last_evaluated_at': datetime.now().isoformat()
+        }
+
+        def format_sql_literal(value):
+            if value is None: return "NULL"
+            if isinstance(value, (int, float)): return str(value)
+            return f"'{str(value).replace("'", "''")}'"
+
+        if existing_id:
+            if existing_type != followup_type:
+                sql = f"UPDATE email_schedules SET email_type = {format_sql_literal(followup_type)}, metadata = json_patch(COALESCE(metadata, '{{}}'), {format_sql_literal(json.dumps(metadata))}) WHERE id = {existing_id};"
+                sql_statements.append(sql)
+        else:
+            sql = f"""
+                INSERT INTO email_schedules (contact_id, email_type, scheduled_send_date, scheduled_send_time, status, metadata, event_year)
+                VALUES ({contact_id}, {format_sql_literal(followup_type)}, {format_sql_literal(scheduled_send_date)}, 
+                        {format_sql_literal(STANDARD_SEND_TIME)}, 'pre-scheduled', {format_sql_literal(json.dumps(metadata))}, {format_sql_literal(event_year)});
+            """
+            sql_statements.append(sql)
+
+        if sql_statements:
+            sql_statements.append(f"UPDATE email_schedules SET metadata = json_set(COALESCE(metadata, '{{}}'), '$.followup_processed', 'true') WHERE id = {email_data['id']};")
+
+        return True, sql_statements
+
+    async def _get_existing_followup_schedule(self, conn: sqlite3.Connection, contact_id: int, event_year: Optional[int]) -> Tuple[Optional[int], Optional[str]]:
+        """Check for an existing, unsent follow-up."""
+        cursor = conn.cursor()
+        query = "SELECT id, email_type FROM email_schedules WHERE contact_id = ? AND email_type LIKE 'followup_%' AND status IN ('pre-scheduled', 'scheduled')"
+        params = [contact_id]
+        if event_year:
+            query += " AND event_year = ?"
+            params.append(event_year)
+        
+        cursor.execute(query, params)
+        result = cursor.fetchone()
+        return (result['id'], result['email_type']) if result else (None, None)
 
 def main():
-    """Main entry point for follow-up scheduler"""
+    """Main entry point for command-line execution."""
     import argparse
+    import asyncio
     
-    parser = argparse.ArgumentParser(description='Follow-up Email Scheduler')
+    parser = argparse.ArgumentParser(description="Run the Active Follow-up Scheduler.")
     parser.add_argument('--db', required=True, help='SQLite database path')
-    parser.add_argument('--config', help='Configuration YAML path')
-    parser.add_argument('--lookback-days', type=int, default=35, help='Days to look back for initial emails')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    
+    parser.add_argument('--lookback', type=int, default=LOOK_BACK_DAYS, help='Days to look back for initial emails.')
+    parser.add_argument('--test', action='store_true', help='Run in test mode without committing changes.')
     args = parser.parse_args()
+
+    # A mock SchedulingConfig and StateRulesEngine are needed to instantiate the class.
+    # In a real app, these would be properly configured.
+    config = SchedulingConfig(send_time="09:00:00", load_balancing_window=1, daily_send_limit=10000)
+    state_rules = StateRulesEngine(db_path=args.db)
+
+    scheduler = FollowupEmailScheduler(config, state_rules, args.db)
     
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    loop = asyncio.get_event_loop()
+    results = loop.run_until_complete(
+        scheduler.run_active_followup_scheduler(lookback_days=args.lookback, test_mode=args.test)
+    )
     
-    # Import configuration
-    from scheduler import SchedulingConfig, StateRulesEngine
-    
-    config = SchedulingConfig.from_yaml(args.config) if args.config else SchedulingConfig()
-    state_rules = StateRulesEngine()
-    
-    # Initialize and run follow-up scheduler
-    followup_scheduler = FollowupEmailScheduler(config, state_rules, args.db)
-    scheduled_count = followup_scheduler.schedule_followup_emails(args.lookback_days)
-    
-    print(f"Follow-up scheduling complete: {scheduled_count} follow-ups scheduled")
+    print(f"Scheduler run finished. Results: {results}")
 
 if __name__ == '__main__':
     main()
